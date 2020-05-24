@@ -1,3 +1,3 @@
-module github.com/roy-michael/dlb
+module gitlab.com/roy.mchl/drl
 
 go 1.14
