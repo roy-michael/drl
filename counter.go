@@ -11,15 +11,20 @@ import (
 )
 
 type (
+	// timedCounter, used to hold and sync counters between cluster members
 	timedCounter struct {
-		members []string
-		main    map[string]uint64
-		new     map[string]uint64
-		tke     *time.Ticker
-		tks     *time.Ticker
 		client  http.Client
-		lk      *sync.RWMutex
-		nlk     *sync.RWMutex
+		members []string
+		main    map[string]uint64 // global counter state
+		new     map[string]uint64 // local count
+
+		lk  *sync.RWMutex
+		nlk *sync.RWMutex
+	}
+
+	SyncRequest struct {
+		Sec    int         `json:"sec"`
+		Values []SyncValue `json:"values"`
 	}
 
 	SyncValue struct {
@@ -29,21 +34,21 @@ type (
 	}
 )
 
-func newCounters(members []string, notify, elapse, timeout time.Duration) timedCounter {
+func newCounters(members []string, timeout time.Duration) timedCounter {
 	return timedCounter{
 		members: members,
 		main:    make(map[string]uint64),
 		new:     make(map[string]uint64),
-		tke:     time.NewTicker(elapse),
-		tks:     time.NewTicker(notify),
-		lk:      &sync.RWMutex{},
-		nlk:     &sync.RWMutex{},
+
+		lk:  &sync.RWMutex{},
+		nlk: &sync.RWMutex{},
 		client: http.Client{
 			Timeout: timeout,
 		},
 	}
 }
 
+// read the global and local counters for ID
 func (c *timedCounter) get(id string) uint64 {
 	c.lk.RLock()
 	c.nlk.RLock()
@@ -53,22 +58,32 @@ func (c *timedCounter) get(id string) uint64 {
 	return c.main[id] + c.new[id]
 }
 
+// increment the counter for the given ID
 func (c *timedCounter) inc(id string) {
 	c.nlk.Lock()
 	defer c.nlk.Unlock()
 
-	log.Println("increasing counters:", c.main, c.new)
+	log.Println("DEBUG\tincreasing new counter:", id, c.new)
 
 	c.new[id] += 1
 }
 
-func (c *timedCounter) apply(vals []SyncValue) map[string]uint64 {
+// apply locally the counter of other cluster member
+// the method returns the local counters in case they are bigger
+func (c *timedCounter) apply(req SyncRequest) map[string]uint64 {
+
+	if req.Sec > time.Now().Second() {
+		log.Println("WARN\ttime has already elapsed. ignoring request")
+		return nil
+	}
+
 	c.lk.Lock()
 	defer c.lk.Unlock()
 
-	log.Println("increasing counters:", c.main)
+	log.Println("DEBUG\tincreasing counters:", c.main)
 	ret := make(map[string]uint64)
-	for _, val := range vals {
+
+	for _, val := range req.Values {
 		id := val.Id
 		if c.main[id] > val.Current {
 			ret[id] = c.main[id]
@@ -81,6 +96,7 @@ func (c *timedCounter) apply(vals []SyncValue) map[string]uint64 {
 	return ret
 }
 
+// merging the locally new collected counters with the global ones
 func (c *timedCounter) merge() {
 
 	c.lk.Lock()
@@ -92,7 +108,7 @@ func (c *timedCounter) merge() {
 		return
 	}
 
-	log.Println("merging new counters to main:", len(c.new))
+	log.Println("DEBUG\tmerging new counters to main:", len(c.new))
 
 	for k, v := range c.new {
 		c.main[k] += v
@@ -101,6 +117,7 @@ func (c *timedCounter) merge() {
 	c.new = make(map[string]uint64)
 }
 
+// notifying the other cluster members with the locally collected counters
 func (c *timedCounter) notify() error {
 	c.lk.Lock()
 	c.nlk.Lock()
@@ -111,15 +128,13 @@ func (c *timedCounter) notify() error {
 		return nil
 	}
 
-	log.Println("syncing counters with cluster members", c.members)
+	log.Println("INFO\tsyncing counters with cluster members", c.members)
 
 	wg := sync.WaitGroup{}
 	body, err := json.Marshal(c.prepareRequest())
 	if err != nil {
 		return err
 	}
-
-	//log.Println("json:", string(body))
 
 	for _, member := range c.members {
 		wg.Add(1)
@@ -129,15 +144,15 @@ func (c *timedCounter) notify() error {
 
 			switch {
 			case err != nil:
-				log.Println("error syncing counters:", err)
+				log.Println("WARN\terror syncing counters:", err)
 			case resp.StatusCode == http.StatusOK:
-				log.Println("response: ", resp.Status)
+				log.Println("DEBUG\tresponse: ", resp.Status)
 
 			case resp.StatusCode == http.StatusConflict:
-				log.Println("conflicting response values")
+				log.Println("WARN\tconflicting response values")
 				var m map[string]uint64
 				if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
-					log.Println("error decoding response:", err)
+					log.Println("ERROR\terror decoding response:", err)
 					return
 				}
 				c.mergeConflict(m)
@@ -149,51 +164,65 @@ func (c *timedCounter) notify() error {
 	return nil
 }
 
-func (c *timedCounter) start() {
+// start periodic tasks for syncing counters between cluster members and resetting the counters when the minute is over
+func (c *timedCounter) start(notify time.Duration) {
 
 	tm := time.After(time.Second * time.Duration(60-time.Now().Second()))
+	tke := time.NewTicker(10 * time.Second) // initial duration for a ticker for resetting the counters
+	tks := time.NewTicker(notify)           // ticker for running the counter notification to all cluster members
 
 	for {
 		select {
-		case <-tm:  //ticker for resetting the periodic 1 min ticker at the beginning of the minute
-			log.Println("creating ticker")
-			c.tke.Stop()
-			c.tke = time.NewTicker(time.Minute)
-		case <-c.tke.C:
+		case <-tm: //ticker for resetting the periodic 1 min ticker at the beginning of the minute
+			log.Println("INFO\tcreating ticker")
+			tke.Stop()
+			tke = time.NewTicker(time.Minute)
+		case <-tke.C:
 			c.reset()
-		case <-c.tks.C:
+		case <-tks.C:
 			if err := c.notify(); err != nil {
-				log.Println("error syncing counters: ", err)
+				log.Println("ERROR\terror syncing counters: ", err)
 			}
 			c.merge()
 		}
 	}
 }
 
+// resetting the maps we use for collecting the request counts
 func (c *timedCounter) reset() {
 	c.lk.Lock()
+	c.nlk.Lock()
+	defer c.nlk.Unlock()
 	defer c.lk.Unlock()
-	log.Println("resetting counters")
+
+	log.Println("INFO\tresetting counters")
 
 	c.main = make(map[string]uint64)
+	c.new = make(map[string]uint64)
 }
 
-func (c *timedCounter) prepareRequest() []SyncValue {
-	var counters []SyncValue
+// preparing the request with all new saved counters for for sending to all cluster members
+func (c *timedCounter) prepareRequest() SyncRequest {
+	req := SyncRequest{
+		Sec:    time.Now().Second(),
+		Values: nil,
+	}
+
 	for k, v := range c.new {
-		counters = append(counters, SyncValue{
+		req.Values = append(req.Values, SyncValue{
 			Id:      k,
 			Current: c.main[k],
 			New:     v,
 		})
 	}
 
-	return counters
-
+	return req
 }
 
+// mergeConflict is used for merging counters when the other cluster member has a larger counter than us.
+// in this case, we set our own counter with that value
 func (c *timedCounter) mergeConflict(m map[string]uint64) {
-	log.Println("merging conflicted counters to main:", len(m))
+	log.Println("INFO\tmerging conflicted counters to main:", len(m))
 
 	for k, v := range m {
 		if c.main[k] < v {

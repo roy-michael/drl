@@ -12,14 +12,14 @@ import (
 var (
 	addr       = flag.String("addr", "localhost:8000", "address to listen on")
 	members    = flag.String("members", "", "addresses of other cluster members")
-	maxAllowed = flag.Int("maxAllowed", 6, "the max...")
+	maxAllowed = flag.Int("maxAllowed", 600, "the maximum number of allowed requests per minute")
 )
 
 type (
+	// server the server struct. it embeds the http server and the counter to sync the global request counts
 	server struct {
 		http.Server
-		c   timedCounter
-		max int
+		tc timedCounter
 	}
 )
 
@@ -31,7 +31,7 @@ func newServer(members []string, maxAllowed int) *server {
 			Handler: mux,
 			Addr:    *addr,
 		},
-		c: newCounters(members, 1*time.Second, 10*time.Second, 2*time.Second),
+		tc: newCounters(members, 2*time.Second),
 	}
 
 	mux.HandleFunc("/verify", s.verify(maxAllowed))
@@ -40,11 +40,11 @@ func newServer(members []string, maxAllowed int) *server {
 	return &s
 }
 
+// the endpoint for the load balancer to verify if the given ID should be allowed for proxing the request
+// max, the maximum allowed requests
 func (s *server) verify(max int) http.HandlerFunc {
 
 	return func(w http.ResponseWriter, r *http.Request) {
-
-		log.Println("handling request:", r.URL)
 
 		id := r.URL.Query().Get("id")
 		if id == "" {
@@ -52,43 +52,44 @@ func (s *server) verify(max int) http.HandlerFunc {
 			return
 		}
 
-		c := s.c.get(id)
-		log.Println("reading counter for id", id, ":", c)
+		c := s.tc.get(id)
+		log.Println("DEBUG\treading counter for id", id, ":", c)
 		if c := c; c >= uint64(max) {
 			http.Error(w, "request quota exceeded", http.StatusServiceUnavailable)
 			return
 		}
 
-		s.c.inc(id)
+		s.tc.inc(id)
 	}
 }
 
+// endpoint for syncing the counter state between cluster members
 func (s *server) syncState() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		var m []SyncValue
+		var m SyncRequest
 		if err := json.NewDecoder(r.Body).Decode(&m); err != nil {
-			log.Println("error unmarshalling:", err)
+			log.Println("ERROR\terror unmarshalling:", err)
 		}
-		log.Println("request", m)
-		ret := s.c.apply(m)
+		log.Println("DEBUG\trequest", m)
+		ret := s.tc.apply(m)
 		if len(ret) > 0 {
 			w.WriteHeader(http.StatusConflict)
 			if err := json.NewEncoder(w).Encode(ret); err != nil {
-				log.Println("error writing response:", err)
+				log.Println("WARN\terror writing response:", err)
 			}
 		}
 	}
 }
 
 func (s *server) ListenAndServe() error {
-	go s.c.start()
+	go s.tc.start(1 * time.Second)
 	return s.Server.ListenAndServe()
 }
 
 func main() {
 	flag.Parse()
 
-	log.Println("starting the distributed rate limiter. listening on", *addr)
+	log.Println("INFO\tstarting the distributed rate limiter. listening on", *addr)
 
 	s := newServer(strings.Split(*members, ","), *maxAllowed)
 
