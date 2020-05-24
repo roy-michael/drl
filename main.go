@@ -12,7 +12,7 @@ import (
 var (
 	addr       = flag.String("addr", "localhost:8000", "address to listen on")
 	members    = flag.String("members", "", "addresses of other cluster members")
-	maxAllowed = flag.Int("maxAllowed", 600, "the maximum number of allowed requests per minute")
+	maxAllowed = flag.Int("maxAllowed", 500, "the maximum number of allowed requests per minute")
 )
 
 type (
